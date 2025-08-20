@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Email Harvester (Supabase Entegrasyonlu)
-- HTTP/2 kapalı (stabilite için)
-- H2/H1 protocol fallback
+Email Harvester (Supabase Entegrasyonlu, Geniş Kapsamlı Tarama)
+- HTTP/2 kapalı + H2/H1 fallback (stabil)
 - Hata dayanıklı (tek site patlasa bile süreç devam eder)
-- Öncelikli sayfa taraması: contact/kontakt, impressum/imprint, privacy/datenschutz, about vb.
-- Supabase "restaurants" tablosu: contact_email alanını günceller
+- Robots.txt → Sitemap(ler) → Öncelikli sayfalar (contact/kontakt, impressum/imprint, privacy/datenschutz, about/ueber-uns, colophon/colofon vb.)
+- Cloudflare e-posta gizleme (data-cfemail) çözümü
+- JSON-LD / metin/anchor’dan e-posta çıkarma + obfuscation çözme
+- Supabase "restaurants.contact_email" güncellemesi
+- 416 (offset aralığı kalmadı) güvenli yakalama + stabil sıralama
 - Parametreler: --limit, --offset, --concurrency, --per-host, --pages, --timeout, --verbose
 """
 
@@ -16,9 +18,8 @@ import argparse
 import re
 import sys
 import json
-import base64
 import time
-from typing import List, Set, Tuple, Optional
+from typing import List, Set, Tuple, Optional, Iterable
 from urllib.parse import urljoin, urlparse
 
 import httpx, httpcore
@@ -33,7 +34,11 @@ except Exception:
 try:
     from supabase import create_client
 except Exception:
-    create_client = None  # Supabase modülü yoksa tek URL modu yine çalışabilir.
+    create_client = None  # Supabase modülü yoksa "single" modu yine çalışır.
+
+# ------------------------------
+# Sabitler ve regexler
+# ------------------------------
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -45,26 +50,53 @@ EMAIL_RE = re.compile(
     r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.IGNORECASE
 )
 
+# Yaygın obfuscation desenleri
 OBFUSCATIONS = [
     (r"\s?\(at\)\s?", "@"),
     (r"\s?\[at\]\s?", "@"),
     (r"\s?\{at\}\s?", "@"),
     (r"\s+at\s+", "@"),
+    (r"\s?\(ät\)\s?", "@"),
+    (r"\s?\[ät\]\s?", "@"),
+    (r"\s?\{ät\}\s?", "@"),
+    (r"\s+ät\s+", "@"),
     (r"\s?\(dot\)\s?", "."),
     (r"\s?\[dot\]\s?", "."),
     (r"\s?\{dot\}\s?", "."),
     (r"\s+dot\s+", "."),
     (r"\s?\(punkt\)\s?", "."),
     (r"\s+punkt\s+", "."),
+    (r"\s?\(punto\)\s?", "."),
+    (r"\s+punto\s+", "."),
+    (r"\s+[\u00A0\u2007\u202F]\s*", " "),  # NBSP ve ince boşluklar
 ]
 
 PRIORITY_KEYWORDS = [
-    "contact", "kontakt", "impressum", "imprint",
-    "privacy", "datenschutz", "legal", "about",
-    "colophon", "colofon", "colofon", "colofone",
-    "mentions", "mentions-legales",
+    "contact", "kontakt", "contact-us", "kontaktformular",
+    "impressum", "imprint", "legal", "mentions", "mentions-legales",
+    "privacy", "datenschutz", "policy", "datenschutzerklaerung",
+    "about", "ueber-uns", "über-uns", "uber-uns", "team",
+    "info", "colophon", "colofon", "colofone",
     "kuntakt", "iletisim", "iletişim",
 ]
+
+PRIORITY_PATHS = [
+    "/", "/contact", "/contact/", "/contact-us", "/contact-us/",
+    "/kontakt", "/kontakt/", "/kontaktformular", "/kontaktformular/",
+    "/impressum", "/impressum/", "/imprint", "/imprint/", "/legal", "/legal/",
+    "/privacy", "/privacy/", "/datenschutz", "/datenschutz/", "/policy", "/policy/",
+    "/about", "/about/", "/ueber-uns", "/ueber-uns/", "/uber-uns", "/uber-uns/",
+    "/über-uns", "/über-uns/", "/team", "/team/",
+    "/colophon", "/colophon/", "/colofon", "/colofon/",
+    "/kuntakt", "/kuntakt/", "/iletisim", "/iletisim/", "/iletişim", "/iletişim/",
+    "/.well-known/security.txt",
+]
+
+SITEMAP_LIMIT_PER_HOST = 10  # sitemap'tan çekilecek öncelikli URL limiti
+
+# ------------------------------
+# Yardımcı fonksiyonlar
+# ------------------------------
 
 def normalize_url(u: str) -> Optional[str]:
     if not u:
@@ -76,7 +108,6 @@ def normalize_url(u: str) -> Optional[str]:
         return u
     if not u.startswith("http://") and not u.startswith("https://"):
         u = "https://" + u
-    # basic sanity
     try:
         p = urlparse(u)
         if not p.netloc:
@@ -107,18 +138,22 @@ def extract_emails_from_text(text: str) -> Set[str]:
         emails.add(m)
     return emails
 
+def cf_decode(hexstr: str) -> Optional[str]:
+    """
+    Cloudflare email gizleme (data-cfemail) çözümü.
+    """
+    try:
+        r = int(hexstr[:2], 16)
+        email = ''.join(chr(int(hexstr[i:i+2], 16) ^ r) for i in range(2, len(hexstr), 2))
+        return email
+    except Exception:
+        return None
+
 def score_email_for_website(email: str, base_url: str) -> int:
-    """
-    Daha iyi seçim için basit bir skor:
-    +3: eposta domaini siteyle aynıysa
-    +2: local kısmı 'info|kontakt|contact|hello|mail'
-    +1: 'support|team|office'
-    -1: 'noreply|no-reply'
-    """
     score = 0
     try:
-        host = urlparse(base_url).hostname or ""
-        domain = host.split(":")[0].lower()
+        host = (urlparse(base_url).hostname or "").lower()
+        domain = host.split(":")[0]
         email_domain = email.split("@", 1)[-1].lower()
         if email_domain.endswith(domain):
             score += 3
@@ -139,11 +174,14 @@ def pick_best_email(emails: Set[str], base_url: str) -> Optional[str]:
     ranked = sorted(emails, key=lambda e: (-score_email_for_website(e, base_url), e))
     return ranked[0]
 
+# ------------------------------
+# HTTP istemcisi (H2 kapalı + fallback)
+# ------------------------------
+
 class Fetcher:
     def __init__(self, timeout: float = 15.0, verbose: bool = False):
         self.verbose = verbose
         self.timeout = httpx.Timeout(timeout, connect=20.0)
-        # H2 kapalı; limitler ayarlı
         self.client = httpx.AsyncClient(
             timeout=self.timeout,
             headers={"User-Agent": UA},
@@ -163,12 +201,11 @@ class Fetcher:
         try:
             r = await self.client.get(url, follow_redirects=True)
             r.raise_for_status()
-            ct = r.headers.get("content-type", "")
+            ct = (r.headers.get("content-type") or "").lower()
             if "text" not in ct and "json" not in ct and "xml" not in ct:
                 return None
             return r.text
         except (H2ProtocolError, httpx.RemoteProtocolError, httpcore.ProtocolError) as e:
-            # Ekstra güvenlik: ayrı bir client ile fallback (H1)
             if self.verbose:
                 print(f"[H2->H1 fallback] {url} -> {e}", flush=True)
             try:
@@ -185,7 +222,58 @@ class Fetcher:
                 print(f"[GET ERR] {url} -> {e}", flush=True)
             return None
 
-def extract_links_and_emails(html: str, base_url: str) -> Tuple[Set[str], Set[str]]:
+# ------------------------------
+# HTML/Robots/Sitemap çıkarımı
+# ------------------------------
+
+def parse_sitemap_xml(xml_text: str) -> List[str]:
+    """
+    Basit sitemap parser: <urlset> veya <sitemapindex> içinden <loc> linklerini döndürür.
+    """
+    urls: List[str] = []
+    if not xml_text:
+        return urls
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+        for loc in soup.find_all("loc"):
+            u = (loc.text or "").strip()
+            if u:
+                urls.append(u)
+    except Exception:
+        pass
+    return urls
+
+async def discover_sitemaps(fetcher: Fetcher, base_url: str) -> List[str]:
+    host = normalize_url(base_url)
+    if not host:
+        return []
+    # 1) robots.txt → Sitemap:
+    robots_url = urljoin(host.rstrip("/") + "/", "/robots.txt")
+    robots = await fetcher.get(host, robots_url)
+    sitemaps: List[str] = []
+    if robots:
+        for line in robots.splitlines():
+            line = line.strip()
+            if line.lower().startswith("sitemap:"):
+                sm = line.split(":", 1)[1].strip()
+                sm = normalize_url(sm) or sm
+                if sm:
+                    sitemaps.append(sm)
+    # 2) Klasik yollar
+    if not sitemaps:
+        for candidate in ["/sitemap.xml", "/sitemap_index.xml"]:
+            sitemaps.append(urljoin(host, candidate))
+    # sıralı ve benzersiz
+    out: List[str] = []
+    seen = set()
+    for u in sitemaps:
+        u = normalize_url(u)
+        if u and u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
+
+def extract_links_emails_from_html(html: str, base_url: str) -> Tuple[Set[str], Set[str]]:
     links: Set[str] = set()
     emails: Set[str] = set()
     if not html:
@@ -193,12 +281,18 @@ def extract_links_and_emails(html: str, base_url: str) -> Tuple[Set[str], Set[st
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # mailto: ve sayfa metni
+    # Cloudflare obfuscation
+    for span in soup.select("span.__cf_email__"):
+        hexstr = span.get("data-cfemail") or ""
+        em = cf_decode(hexstr) if hexstr else None
+        if em:
+            emails.add(em)
+
+    # anchor href + mailto:
     for a in soup.find_all("a", href=True):
         href = a.get("href") or ""
         if href.startswith("mailto:"):
             em = href[7:].strip()
-            # mailto:info@example.com?subject= => temizle
             if "?" in em:
                 em = em.split("?", 1)[0].strip()
             if em:
@@ -207,32 +301,38 @@ def extract_links_and_emails(html: str, base_url: str) -> Tuple[Set[str], Set[st
             absu = urljoin(base_url, href)
             links.add(absu)
 
-    # JSON-LD içindeki eposta
+    # microdata/json-ld
     for s in soup.find_all("script", type=lambda t: t and "ld+json" in t):
         try:
             data = json.loads(s.text.strip())
-            def extract_from_obj(o):
+            def walk(o):
                 if isinstance(o, dict):
                     for k, v in o.items():
-                        if k.lower() == "email" and isinstance(v, str):
+                        if isinstance(v, str) and k.lower() == "email":
                             em = v.strip()
                             if em.startswith("mailto:"):
                                 em = em[7:]
                             emails.add(em)
                         else:
-                            extract_from_obj(v)
+                            walk(v)
                 elif isinstance(o, list):
                     for it in o:
-                        extract_from_obj(it)
-            extract_from_obj(data)
+                        walk(it)
+            walk(data)
         except Exception:
             pass
 
-    # Metinden çıkar
+    # data-email / meta email ipuçları
+    for t in soup.find_all(attrs={"data-email": True}):
+        em = (t.get("data-email") or "").strip()
+        if em:
+            emails.add(em)
+
+    # ham metin
     text = soup.get_text(" ", strip=True)
     emails |= extract_emails_from_text(text)
 
-    # Öncelikli linkleri öne alabilmek için linkleri filtrele (sadece aynı host ve öncelik adayları)
+    # öncelikli link filtresi (aynı host + anahtar kelime)
     filtered: Set[str] = set()
     base_host = urlparse(base_url).netloc
     for u in links:
@@ -245,21 +345,74 @@ def extract_links_and_emails(html: str, base_url: str) -> Tuple[Set[str], Set[st
 
     return filtered or links, emails
 
+def priority_seeds_for(base_url: str) -> List[str]:
+    seeds: List[str] = []
+    p = urlparse(base_url)
+    root = f"{p.scheme}://{p.netloc}"
+    for path in PRIORITY_PATHS:
+        seeds.append(urljoin(root, path))
+    # benzersiz
+    seen = set()
+    out = []
+    for u in seeds:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+# ------------------------------
+# Tarama (tek site)
+# ------------------------------
+
 async def crawl_one_site(fetcher: Fetcher, base_url: str, pages: int = 6, verbose: bool = False) -> Tuple[Set[str], Set[str], Set[str]]:
     """
-    Bir sitenin içinde en fazla `pages` sayfa gezerek email arar.
+    Bir sitenin içinde en fazla `pages` sayfa gezerek e-posta arar.
     Dönüş: (emails, scanned_pages, visited)
     """
     base = normalize_url(base_url)
     if not base:
         return set(), set(), set()
-    visited: Set[str] = set()
-    to_visit: List[str] = [base]
-    found_emails: Set[str] = set()
-    scanned: Set[str] = set()
 
-    # Öncelik: kontakt/impressum vb. sayfalar
-    # İlk sayfadan sonra, çıkan öncelikli linkleri kuyruğa koyar.
+    visited: Set[str] = set()
+    scanned: Set[str] = set()
+    found_emails: Set[str] = set()
+
+    # Başlangıç kuyruğu (öncelik: bilinen sayfalar)
+    to_visit: List[str] = []
+    # 1) Öncelikli path'ler
+    to_visit.extend(priority_seeds_for(base))
+    # 2) robots → sitemap → öncelikli URL'ler
+    try:
+        sitemaps = await discover_sitemaps(fetcher, base)
+        prio_from_sitemaps: List[str] = []
+        for sm in sitemaps:
+            xml = await fetcher.get(base, sm)
+            urls = parse_sitemap_xml(xml or "")
+            # sadece aynı host ve anahtar kelime içerenler
+            candidates = []
+            host = urlparse(base).netloc
+            for u in urls:
+                try:
+                    pu = urlparse(u)
+                    if pu.netloc != host:
+                        continue
+                    path_lower = (pu.path or "").lower()
+                    if any(k in path_lower for k in PRIORITY_KEYWORDS):
+                        candidates.append(u)
+                except Exception:
+                    continue
+            prio_from_sitemaps.extend(candidates[:SITEMAP_LIMIT_PER_HOST])
+        # sitemap önceliklerini başa ekle (front of queue)
+        to_visit = prio_from_sitemaps + to_visit
+    except Exception as e:
+        if verbose:
+            print(f"[SITEMAP ERR] {base} -> {e}", flush=True)
+
+    # 3) En sonda ana sayfa
+    if base not in to_visit:
+        to_visit.append(base)
+
+    # BFS
     while to_visit and len(scanned) < pages:
         url = to_visit.pop(0)
         if url in visited:
@@ -269,26 +422,27 @@ async def crawl_one_site(fetcher: Fetcher, base_url: str, pages: int = 6, verbos
         html = await fetcher.get(base, url)
         if not html:
             continue
-        scanned.add(url)
 
-        links, emails = extract_links_and_emails(html, base)
+        scanned.add(url)
+        links, emails = extract_links_emails_from_html(html, base)
         if emails:
             found_emails |= emails
-            # bir email bulunca yine de 1-2 öncelikli sayfaya bakmak faydalı olabilir
+            # email bulunduysa yine de sınırlı devam edelim (sayfa limitiyle)
             if len(scanned) >= pages:
                 break
 
-        # Yeni öncelikli linkleri ekle (BFS)
+        # yeni linkleri kuyruğa ekle
         for lk in links:
             if lk not in visited and same_host(base, lk):
                 to_visit.append(lk)
 
     return found_emails, scanned, visited
 
+# ------------------------------
+# Concurrency / per-host sınırı
+# ------------------------------
+
 class HostLimiter:
-    """
-    Aynı host için eşzamanlı istek sayısını sınırlamak (per-host)
-    """
     def __init__(self, per_host: int):
         self.per_host = max(1, per_host)
         self._locks = {}
@@ -298,6 +452,10 @@ class HostLimiter:
         if host not in self._locks:
             self._locks[host] = asyncio.Semaphore(self.per_host)
         return self._locks[host]
+
+# ------------------------------
+# Supabase iş akışı
+# ------------------------------
 
 async def run_supabase(
     url: str,
@@ -316,18 +474,29 @@ async def run_supabase(
 
     sb = create_client(url, key)
 
-    # Aday listesi: email yok, website var
+    # Aday listesi: contact_email IS NULL AND website NOT NULL
     q = (
         sb.table("restaurants")
           .select("id,name,website,contact_email", count="exact")
           .is_("contact_email", None)
           .not_.is_("website", None)
+          .order("id")  # stabil sıralama (kritik)
     )
-    start = offset
-    end = offset + limit - 1
-    resp = q.range(start, end).execute()
-    candidates = resp.data or []
-    total = resp.count or len(candidates)
+
+    start = max(0, int(offset))
+    end   = start + int(limit) - 1
+
+    try:
+        resp = q.range(start, end).execute()
+        candidates = resp.data or []
+        total = resp.count or (len(candidates) if candidates is not None else 0)
+    except Exception as e:
+        # 416: İstenen aralık kalmadı (dataset küçüldü) → kibarca çık
+        msg = str(e)
+        if "code': 416" in msg or " 416" in msg or "Requested Range Not Satisfiable" in msg:
+            print(f"Aday sayısı (bu dilimde): 0  (offset aralığı geçersiz)", flush=True)
+            return
+        raise
 
     print(f"Aday sayısı (bu dilimde): {len(candidates)} / toplam: {total}", flush=True)
     if not candidates:
@@ -345,11 +514,8 @@ async def run_supabase(
             if verbose:
                 print(f"[SKIP] {name:40} | website yok/geçersiz", flush=True)
             return
-        # per-host sınırı + global concurrency
         async with sem, limiter.semaphore_for(website):
             try:
-                # İlerleme sinyali (isteğe bağlı yorumlayabilirsin)
-                # print(f"[START] {name:40} | {website[:60]}", flush=True)
                 emails, _scanned, _visited = await crawl_one_site(
                     fetcher, website, pages=pages, verbose=verbose
                 )
@@ -359,12 +525,10 @@ async def run_supabase(
                     print(f"[SB] {name:40} | {website:60} | {email}", flush=True)
                 else:
                     print(f"[SB] {name:40} | {website:60} | -", flush=True)
-                # print(f"[DONE ] {name:40} | {website[:60]}", flush=True)
             except Exception as e:
                 print(f"[ERR] {name:40} | {website:60} | {e}", flush=True)
 
     tasks = [asyncio.create_task(worker(r)) for r in candidates]
-    # Tek bir site patlasa bile süreç dursun istemiyoruz
     for t in asyncio.as_completed(tasks):
         try:
             await t
@@ -374,7 +538,18 @@ async def run_supabase(
     await fetcher.close()
     print("✓ Supabase güncellemesi tamam", flush=True)
 
-async def run_single(urls: List[str], pages: int = 6, concurrency: int = 10, per_host: int = 2, timeout: float = 15.0, verbose: bool = False):
+# ------------------------------
+# Tekil URL modu (test)
+# ------------------------------
+
+async def run_single(
+    urls: List[str],
+    pages: int = 6,
+    concurrency: int = 10,
+    per_host: int = 2,
+    timeout: float = 15.0,
+    verbose: bool = False,
+):
     fetcher = Fetcher(timeout=timeout, verbose=verbose)
     limiter = HostLimiter(per_host=per_host)
     sem = asyncio.Semaphore(concurrency)
@@ -395,6 +570,10 @@ async def run_single(urls: List[str], pages: int = 6, concurrency: int = 10, per
     await asyncio.gather(*(one(u) for u in urls))
     await fetcher.close()
 
+# ------------------------------
+# CLI
+# ------------------------------
+
 def main():
     ap = argparse.ArgumentParser(description="Email harvester")
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -411,7 +590,7 @@ def main():
     ap_sb.add_argument("--timeout", type=float, default=15.0)
     ap_sb.add_argument("--verbose", action="store_true")
 
-    # Tekil URL modu (test/demolar için)
+    # Tekil URL modu
     ap_one = sub.add_parser("single", help="Tekil URL(ler) için e-posta ara")
     ap_one.add_argument("urls", nargs="+")
     ap_one.add_argument("--pages", type=int, default=6)
@@ -427,7 +606,8 @@ def main():
             run_supabase(
                 args.url, args.key, args.limit, pages=args.pages,
                 concurrency=args.concurrency, per_host=args.per_host,
-                timeout=args.timeout, verbose=bool(args.verbose), offset=args.offset
+                timeout=args.timeout, verbose=bool(args.verbose),
+                offset=args.offset
             )
         )
     elif args.mode == "single":
